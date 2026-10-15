@@ -1,10 +1,9 @@
 const DEFAULT_MODEL = "gemini-3.5-flash-lite";
-const FALLBACK_MODEL = "gemini-3.8-flash"; // Резервная модель на случай перегрузки
+const FALLBACK_MODEL = "gemini-3.8-flash";
 const MAX_HISTORY_MESSAGES = 8;
 const MAX_HISTORY_MESSAGE_CHARS = 1000;
 const MAX_ALICE_TEXT = 1024;
 
-// Яндекс Диалоги ждут ответ до 5 секунд. Используем 4.8 сек с запасом.
 const TOTAL_RESPONSE_BUDGET_MS = 4800;
 const SERPER_TIMEOUT_MS = 850;
 const GEMINI_TIMEOUT_MS = 3600;
@@ -223,4 +222,104 @@ async function askGemini(text, history, searchContext, timeoutMs) {
   if (!key) throw new Error("MISSING_GEMINI_KEY");
   if (timeoutMs < 350) throw new Error("TIME_BUDGET_EXHAUSTED");
 
-  const primary
+  const primaryModel = String(process.env.GEMINI_MODEL || DEFAULT_MODEL).trim();
+  
+  try {
+    return await callGeminiModel(primaryModel, text, history, searchContext, timeoutMs);
+  } catch (error) {
+    if (error.message === "GEMINI_OVERLOADED" || error.message === "GEMINI_REQUEST_FAILED") {
+      console.warn(`Model ${primaryModel} failed, switching to fallback ${FALLBACK_MODEL}`);
+      return await callGeminiModel(FALLBACK_MODEL, text, history, searchContext, timeoutMs);
+    }
+    throw error;
+  }
+}
+
+function errorForUser(error) {
+  const code = typeof error === "string" ? error : error?.message;
+  switch (code) {
+    case "MISSING_GEMINI_KEY":
+      return "Сервер пока не настроен. Проверьте переменную GEMINI_API_KEY в настройках Vercel.";
+    case "GEMINI_KEY_REJECTED":
+      return "Не удалось подключиться к нейросети. Проверьте API-ключ в настройках Vercel.";
+    case "GEMINI_QUOTA":
+    case "GEMINI_OVERLOADED":
+      return "Нейросеть сейчас сильно загружена. Повторите запрос ещё раз.";
+    case "GEMINI_BLOCKED":
+      return "Я не могу ответить на этот запрос из-за ограничений безопасности.";
+    case "TIME_BUDGET_EXHAUSTED":
+    case "AbortError":
+      return "Не успела получить ответ вовремя. Попробуйте повторить вопрос покороче.";
+    default:
+      return "Произошла небольшая заминка при обращении к нейросети. Повторите вопрос ещё раз.";
+  }
+}
+
+export default async function handler(req, res) {
+  if (req.method === "GET") {
+    return res.status(200).json({
+      ok: true,
+      service: "alice-gemini-serper",
+      message: "Webhook is ready. Yandex Dialogs should send POST requests to /api."
+    });
+  }
+
+  if (req.method !== "POST") {
+    res.setHeader("Allow", "GET, POST");
+    return res.status(405).json({ error: "Method not allowed" });
+  }
+
+  const startedAt = Date.now();
+  const remainingMs = () => TOTAL_RESPONSE_BUDGET_MS - (Date.now() - startedAt);
+
+  const body = req.body && typeof req.body === "object" ? req.body : {};
+  const command = String(body?.request?.command || "").trim();
+  const originalUtterance = String(body?.request?.original_utterance || "").trim();
+  const text = originalUtterance || command;
+  const oldHistory = safeHistory(body?.state?.session?.history);
+
+  if (command.toLowerCase() === "ping") {
+    return res.status(200).json(aliceResponse("pong", true, oldHistory));
+  }
+
+  if (!text) {
+    return res.status(200).json(
+      aliceResponse(
+        "Привет! Я помогу ответить на любой вопрос или найти свежую информацию. О чём рассказать?",
+        false,
+        oldHistory
+      )
+    );
+  }
+
+  if (isExitIntent(command || text)) {
+    return res.status(200).json(
+      aliceResponse("Была рада помочь! Обращайтесь ещё.", true, [])
+    );
+  }
+
+  try {
+    let searchContext = "";
+    if (isSearchIntent(text) && process.env.SERPER_API_KEY) {
+      const searchBudget = Math.min(SERPER_TIMEOUT_MS, Math.max(0, remainingMs() - 2500));
+      searchContext = await searchWeb(text, searchBudget);
+    }
+
+    const geminiBudget = Math.max(0, Math.min(GEMINI_TIMEOUT_MS, remainingMs() - 100));
+    const answer = await askGemini(text, oldHistory, searchContext, geminiBudget);
+
+    const cleanAnswer = fitAliceText(answer);
+    const history = safeHistory([
+      ...oldHistory,
+      { role: "user", text },
+      { role: "model", text: cleanAnswer }
+    ]);
+
+    return res.status(200).json(aliceResponse(cleanAnswer, false, history));
+  } catch (error) {
+    console.warn("Alice webhook fallback:", error?.message || error);
+    return res.status(200).json(aliceResponse(errorForUser(error), false, oldHistory));
+  }
+}
+
+export { aliceResponse, fitAliceText, isSearchIntent, safeHistory };
