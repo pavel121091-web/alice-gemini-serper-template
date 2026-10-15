@@ -4,9 +4,10 @@ const MAX_HISTORY_MESSAGES = 8;
 const MAX_HISTORY_MESSAGE_CHARS = 1000;
 const MAX_ALICE_TEXT = 1024;
 
-const TOTAL_RESPONSE_BUDGET_MS = 4800;
-const SERPER_TIMEOUT_MS = 850;
-const GEMINI_TIMEOUT_MS = 3600;
+// Максимально расширяем бюджет под лимит Яндекс Диалогов (5 сек)
+const TOTAL_RESPONSE_BUDGET_MS = 4950;
+const SERPER_TIMEOUT_MS = 500;
+const GEMINI_TIMEOUT_MS = 3800;
 
 const SYSTEM_PROMPT = [
   "Ты — быстрый и полезный голосовой помощник в навыке Яндекс Алисы.",
@@ -114,7 +115,7 @@ async function fetchJson(url, options, timeoutMs) {
 
 async function searchWeb(query, timeoutMs) {
   const key = process.env.SERPER_API_KEY;
-  if (!key || timeoutMs < 250) return "";
+  if (!key || timeoutMs < 200) return "";
 
   try {
     const { response, data } = await fetchJson(
@@ -185,9 +186,8 @@ async function callGeminiModel(modelName, text, history, searchContext, timeoutM
         },
         contents,
         generationConfig: {
-          temperature: 0.4,
-          maxOutputTokens: 400,
-          thinkingConfig: { thinkingLevel: "MINIMAL" }
+          temperature: 0.3,
+          maxOutputTokens: 300
         }
       })
     },
@@ -220,15 +220,15 @@ async function callGeminiModel(modelName, text, history, searchContext, timeoutM
 async function askGemini(text, history, searchContext, timeoutMs) {
   const key = process.env.GEMINI_API_KEY;
   if (!key) throw new Error("MISSING_GEMINI_KEY");
-  if (timeoutMs < 350) throw new Error("TIME_BUDGET_EXHAUSTED");
+  if (timeoutMs < 300) throw new Error("TIME_BUDGET_EXHAUSTED");
 
   const primaryModel = String(process.env.GEMINI_MODEL || DEFAULT_MODEL).trim();
   
   try {
     return await callGeminiModel(primaryModel, text, history, searchContext, timeoutMs);
   } catch (error) {
-    if (error.message === "GEMINI_OVERLOADED" || error.message === "GEMINI_REQUEST_FAILED") {
-      console.warn(`Model ${primaryModel} failed, switching to fallback ${FALLBACK_MODEL}`);
+    if (error.message === "GEMINI_OVERLOADED" || error.message === "GEMINI_REQUEST_FAILED" || error.message === "TIME_BUDGET_EXHAUSTED") {
+      console.warn(`Model ${primaryModel} failed/timeout, switching to fallback ${FALLBACK_MODEL}`);
       return await callGeminiModel(FALLBACK_MODEL, text, history, searchContext, timeoutMs);
     }
     throw error;
@@ -278,48 +278,4 @@ export default async function handler(req, res) {
   const text = originalUtterance || command;
   const oldHistory = safeHistory(body?.state?.session?.history);
 
-  if (command.toLowerCase() === "ping") {
-    return res.status(200).json(aliceResponse("pong", true, oldHistory));
-  }
-
-  if (!text) {
-    return res.status(200).json(
-      aliceResponse(
-        "Привет! Я помогу ответить на любой вопрос или найти свежую информацию. О чём рассказать?",
-        false,
-        oldHistory
-      )
-    );
-  }
-
-  if (isExitIntent(command || text)) {
-    return res.status(200).json(
-      aliceResponse("Была рада помочь! Обращайтесь ещё.", true, [])
-    );
-  }
-
-  try {
-    let searchContext = "";
-    if (isSearchIntent(text) && process.env.SERPER_API_KEY) {
-      const searchBudget = Math.min(SERPER_TIMEOUT_MS, Math.max(0, remainingMs() - 2500));
-      searchContext = await searchWeb(text, searchBudget);
-    }
-
-    const geminiBudget = Math.max(0, Math.min(GEMINI_TIMEOUT_MS, remainingMs() - 100));
-    const answer = await askGemini(text, oldHistory, searchContext, geminiBudget);
-
-    const cleanAnswer = fitAliceText(answer);
-    const history = safeHistory([
-      ...oldHistory,
-      { role: "user", text },
-      { role: "model", text: cleanAnswer }
-    ]);
-
-    return res.status(200).json(aliceResponse(cleanAnswer, false, history));
-  } catch (error) {
-    console.warn("Alice webhook fallback:", error?.message || error);
-    return res.status(200).json(aliceResponse(errorForUser(error), false, oldHistory));
-  }
-}
-
-export { aliceResponse, fitAliceText, isSearchIntent, safeHistory };
+  if
