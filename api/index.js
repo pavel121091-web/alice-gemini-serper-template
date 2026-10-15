@@ -3,9 +3,8 @@ const FALLBACK_MODEL = "gemini-3.8-flash";
 const MAX_HISTORY_MESSAGES = 6;
 const MAX_HISTORY_MESSAGE_CHARS = 800;
 const MAX_ALICE_TEXT = 1024;
-const TOTAL_RESPONSE_BUDGET_MS = 4900;
-const SERPER_TIMEOUT_MS = 350;
-const GEMINI_TIMEOUT_MS = 3800;
+const SERPER_TIMEOUT_MS = 300;
+const GEMINI_TIMEOUT_MS = 4300;
 
 const SYSTEM_PROMPT = [
   "Ты — быстрый голосовой помощник в навыке Яндекс Алисы.",
@@ -78,7 +77,7 @@ function safeHistory(history) {
 
 async function fetchJson(url, options, timeoutMs) {
   const controller = new AbortController();
-  const safeTimeout = Math.max(80, Math.floor(timeoutMs));
+  const safeTimeout = Math.max(150, Math.floor(timeoutMs));
   const timer = setTimeout(() => controller.abort(), safeTimeout);
 
   try {
@@ -97,7 +96,7 @@ async function fetchJson(url, options, timeoutMs) {
 
 async function searchWeb(query, timeoutMs) {
   const key = process.env.SERPER_API_KEY;
-  if (!key || timeoutMs < 150) return "";
+  if (!key) return "";
 
   try {
     const { response, data } = await fetchJson(
@@ -138,52 +137,58 @@ async function callGeminiModel(modelName, text, history, searchContext, timeoutM
   const prompt = searchContext ? `Вопрос: ${text}\nДанные поиска:\n${searchContext}\nОтветь кратко.` : text;
   contents.push({ role: "user", parts: [{ text: prompt }] });
 
-  const { response, data } = await fetchJson(
-    `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "x-goog-api-key": key },
-      body: JSON.stringify({
-        systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
-        contents,
-        generationConfig: { temperature: 0.3, maxOutputTokens: 250 }
-      })
-    },
-    timeoutMs
-  );
+  try {
+    const { response, data } = await fetchJson(
+      `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-goog-api-key": key },
+        body: JSON.stringify({
+          systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
+          contents,
+          generationConfig: { temperature: 0.3, maxOutputTokens: 250 }
+        })
+      },
+      timeoutMs
+    );
 
-  if (!response.ok) {
-    const status = Number(response.status);
-    if (status === 401 || status === 403) throw new Error("GEMINI_KEY_REJECTED");
-    if (status === 429) throw new Error("GEMINI_QUOTA");
-    if (status === 503 || status === 404) throw new Error("GEMINI_OVERLOADED");
-    throw new Error("GEMINI_REQUEST_FAILED");
+    if (!response.ok) {
+      const status = Number(response.status);
+      if (status === 401 || status === 403) throw new Error("GEMINI_KEY_REJECTED");
+      if (status === 429) throw new Error("GEMINI_QUOTA");
+      if (status === 503 || status === 404) throw new Error("GEMINI_OVERLOADED");
+      throw new Error("GEMINI_REQUEST_FAILED");
+    }
+
+    const candidate = data?.candidates?.[0];
+    const answer = (candidate?.content?.parts || [])
+      .filter(part => !part?.thought && typeof part?.text === "string")
+      .map(part => part.text)
+      .join("")
+      .trim();
+
+    if (!answer) throw new Error("GEMINI_EMPTY_RESPONSE");
+    return answer;
+  } catch (error) {
+    throw error;
   }
-
-  const candidate = data?.candidates?.[0];
-  const answer = (candidate?.content?.parts || [])
-    .filter(part => !part?.thought && typeof part?.text === "string")
-    .map(part => part.text)
-    .join("")
-    .trim();
-
-  if (!answer) throw new Error("GEMINI_EMPTY_RESPONSE");
-  return answer;
 }
 
 async function askGemini(text, history, searchContext, timeoutMs) {
   const key = process.env.GEMINI_API_KEY;
   if (!key) throw new Error("MISSING_GEMINI_KEY");
-  if (timeoutMs < 200) throw new Error("TIME_BUDGET_EXHAUSTED");
 
   const primaryModel = String(process.env.GEMINI_MODEL || DEFAULT_MODEL).trim();
   try {
     return await callGeminiModel(primaryModel, text, history, searchContext, timeoutMs);
   } catch (error) {
-    if (["GEMINI_OVERLOADED", "GEMINI_REQUEST_FAILED", "TIME_BUDGET_EXHAUSTED"].includes(error.message)) {
-      return await callGeminiModel(FALLBACK_MODEL, text, history, searchContext, Math.max(150, timeoutMs - 500));
+    console.warn(`Primary model ${primaryModel} failed:`, error.message);
+    try {
+      return await callGeminiModel(FALLBACK_MODEL, text, history, searchContext, Math.max(1000, timeoutMs - 500));
+    } catch (fallbackError) {
+      console.warn(`Fallback model ${FALLBACK_MODEL} failed:`, fallbackError.message);
+      throw fallbackError;
     }
-    throw error;
   }
 }
 
@@ -208,9 +213,6 @@ export default async function handler(req, res) {
     return res.status(405).json({ error: "Method not allowed" });
   }
 
-  const startedAt = Date.now();
-  const remainingMs = () => TOTAL_RESPONSE_BUDGET_MS - (Date.now() - startedAt);
-
   const body = req.body && typeof req.body === "object" ? req.body : {};
   const command = String(body?.request?.command || "").trim();
   const originalUtterance = String(body?.request?.original_utterance || "").trim();
@@ -230,11 +232,10 @@ export default async function handler(req, res) {
   try {
     let searchContext = "";
     if (isSearchIntent(text) && process.env.SERPER_API_KEY) {
-      searchContext = await searchWeb(text, Math.min(SERPER_TIMEOUT_MS, remainingMs() - 3200));
+      searchContext = await searchWeb(text, SERPER_TIMEOUT_MS);
     }
 
-    const geminiBudget = Math.max(300, remainingMs() - 100);
-    const answer = askGemini(text, oldHistory, searchContext, geminiBudget);
+    const answer = await askGemini(text, oldHistory, searchContext, GEMINI_TIMEOUT_MS);
 
     const cleanAnswer = fitAliceText(answer);
     const history = safeHistory([
