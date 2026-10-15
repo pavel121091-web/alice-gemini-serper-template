@@ -1,12 +1,12 @@
-const DEFAULT_MODEL = "gemini-3.5-flash-lite";
+const DEFAULT_MODEL = "gemini-3.8-flash";
 const MAX_HISTORY_MESSAGES = 8;
 const MAX_HISTORY_MESSAGE_CHARS = 1000;
 const MAX_ALICE_TEXT = 1024;
 
-// Яндекс Диалоги ждут ответ до 4.5–5 сек. Оставляем 4100 мс на работу функции и ~400 мс на сеть.
-const TOTAL_RESPONSE_BUDGET_MS = 4100;
-const SERPER_TIMEOUT_MS = 950;
-const GEMINI_TIMEOUT_MS = 3200;
+// Яндекс Диалоги ждут ответ до 5 секунд. Используем 4.8 сек с небольшим запасом.
+const TOTAL_RESPONSE_BUDGET_MS = 4800;
+const SERPER_TIMEOUT_MS = 850;
+const GEMINI_TIMEOUT_MS = 3600;
 
 const SYSTEM_PROMPT = [
   "Ты — быстрый и полезный голосовой помощник в навыке Яндекс Алисы.",
@@ -32,7 +32,6 @@ function aliceResponse(text, endSession = false, history = []) {
 
 function fitAliceText(value) {
   const text = String(value ?? "")
-    // Убираем возможный Markdown и URL, если модель нарушила инструкцию
     .replace(/https?:\/\/\S+/gi, "")
     .replace(/[*#_~`>|]/g, "")
     .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
@@ -73,7 +72,7 @@ function safeHistory(history) {
       text: item.text.trim().slice(0, MAX_HISTORY_MESSAGE_CHARS)
     }));
 
-  // Гарантируем строгое чередование ролей (user -> model), чтобы Gemini не вернул HTTP 400
+  // Гарантируем строгое чередование ролей (user -> model) во избежание HTTP 400 от Gemini
   const normalized = [];
   for (const item of filtered) {
     if (normalized.length === 0) {
@@ -84,31 +83,15 @@ function safeHistory(history) {
     if (prev.role !== item.role) {
       normalized.push(item);
     } else {
-      // Если две одинаковые роли подряд — оставляем более свежую реплику
       normalized[normalized.length - 1] = item;
     }
   }
 
-  // Если после обрезки история начинается с model — отбрасываем первый элемент
   const sliced = normalized.slice(-MAX_HISTORY_MESSAGES);
   if (sliced.length > 0 && sliced[0].role === "model") {
     sliced.shift();
   }
   return sliced;
-}
-
-function getThinkingConfig(model) {
-  const m = model.toLowerCase();
-  if (m.startsWith("gemini-2.5")) {
-    return { thinkingBudget: 0 };
-  }
-  if (m.includes("flash-lite")) {
-    return { thinkingLevel: "MINIMAL" };
-  }
-  if (m.startsWith("gemini-3")) {
-    return { thinkingLevel: "LOW" };
-  }
-  return undefined;
 }
 
 async function fetchJson(url, options, timeoutMs) {
@@ -154,7 +137,6 @@ async function searchWeb(query, timeoutMs) {
     }
 
     const items = [];
-
     const answerBox = data.answerBox?.answer || data.answerBox?.snippet;
     if (answerBox) {
       items.push(`Быстрый ответ: ${String(answerBox).slice(0, 300)}`);
@@ -211,13 +193,8 @@ async function askGemini(text, history, searchContext, timeoutMs) {
 
   const generationConfig = {
     temperature: 0.4,
-    maxOutputTokens: 500
+    maxOutputTokens: 400
   };
-
-  const thinkingConfig = getThinkingConfig(model);
-  if (thinkingConfig) {
-    generationConfig.thinkingConfig = thinkingConfig;
-  }
 
   const { response, data } = await fetchJson(
     `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
@@ -247,7 +224,6 @@ async function askGemini(text, history, searchContext, timeoutMs) {
   }
 
   const candidate = data?.candidates?.[0];
-  // Игнорируем thought-блоки, собираем только финальный текст ответа
   const answer = (candidate?.content?.parts || [])
     .filter(part => !part?.thought && typeof part?.text === "string")
     .map(part => part.text)
@@ -270,7 +246,7 @@ function errorForUser(error) {
     case "MISSING_GEMINI_KEY":
       return "Сервер пока не настроен. Проверьте переменную GEMINI_API_KEY в настройках Vercel.";
     case "GEMINI_KEY_REJECTED":
-      return "Не удалось подключиться к Gemini. Проверьте API-ключ в настройках Vercel.";
+      return "Не удалось подключиться к нейросети. Проверьте API-ключ в настройках Vercel.";
     case "GEMINI_QUOTA":
       return "Сейчас превышен лимит запросов к нейросети. Попробуйте через минуту.";
     case "GEMINI_BLOCKED":
@@ -306,12 +282,10 @@ export default async function handler(req, res) {
   const text = originalUtterance || command;
   const oldHistory = safeHistory(body?.state?.session?.history);
 
-  // Мгновенный ответ на технический пинг Яндекса
   if (command.toLowerCase() === "ping") {
     return res.status(200).json(aliceResponse("pong", true, oldHistory));
   }
 
-  // Приветствие при запуске навыка без фразы
   if (!text) {
     return res.status(200).json(
       aliceResponse(
@@ -322,7 +296,6 @@ export default async function handler(req, res) {
     );
   }
 
-  // Корректное завершение сессии по правилам Яндекс Диалогов
   if (isExitIntent(command || text)) {
     return res.status(200).json(
       aliceResponse("Была рада помочь! Обращайтесь ещё.", true, [])
@@ -332,12 +305,10 @@ export default async function handler(req, res) {
   try {
     let searchContext = "";
     if (isSearchIntent(text) && process.env.SERPER_API_KEY) {
-      // Оставляем минимум 2300 мс на генерацию ответа в Gemini
-      const searchBudget = Math.min(SERPER_TIMEOUT_MS, Math.max(0, remainingMs() - 2300));
+      const searchBudget = Math.min(SERPER_TIMEOUT_MS, Math.max(0, remainingMs() - 2500));
       searchContext = await searchWeb(text, searchBudget);
     }
 
-    // Отдаем всё оставшееся время (минус 100 мс на упаковку ответа) в Gemini
     const geminiBudget = Math.max(0, Math.min(GEMINI_TIMEOUT_MS, remainingMs() - 100));
     const answer = await askGemini(text, oldHistory, searchContext, geminiBudget);
 
